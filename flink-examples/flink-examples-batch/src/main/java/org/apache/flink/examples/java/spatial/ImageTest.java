@@ -18,16 +18,29 @@
 package org.apache.flink.examples.java.spatial;
 
 import org.apache.flink.api.common.functions.FilterFunction;
+import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
 import org.apache.flink.api.common.typeinfo.PrimitiveArrayTypeInfo;
 import org.apache.flink.api.java.DataSet;
 import org.apache.flink.api.java.ExecutionEnvironment;
 import org.apache.flink.api.java.operators.DataSource;
+import org.apache.flink.api.java.spatial.ImageInfoWrapper;
 import org.apache.flink.api.java.spatial.envi.ImageInputFormat;
 import org.apache.flink.api.java.spatial.envi.ImageOutputFormat;
 import org.apache.flink.api.java.tuple.Tuple3;
+import org.apache.flink.api.java.tuple.Tuple4;
 import org.apache.flink.api.java.typeutils.TupleTypeInfo;
+import org.apache.flink.core.fs.FileSystem;
 import org.apache.flink.core.fs.Path;
+
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.text.DateFormat;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.Arrays;
+import java.util.Date;
 
 
 public class ImageTest {
@@ -43,19 +56,46 @@ public class ImageTest {
 		final ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
 		env.setParallelism(dop);
 
-		DataSet<Tuple3<String, byte[], byte[]>> images = readImages(env);
-		DataSet<Tuple3<String, byte[], byte[]>> filtered = images.filter(new FilterFunction<Tuple3<String, byte[], byte[]>>() {
-			static final long serialVersionUID = 1L;
-			int count = 0;
+		// [5-7] Loading an Image Collection
+		DataSet<Tuple3<String, byte[], byte[]>> scenes = readImages(env);
+		// [8] Filter by Date
+		// scenes = scenes.filter(new FilterByDate("2000-04-01", "2000-04-31"));
+		// [9] Filter by RegionOfInterest
+		// TODO
 
-			@Override
-			public boolean filter(Tuple3<String, byte[], byte[]> value) throws Exception {
-				count++;
-				System.out.println("image " + count);
-				return true;
-			}
-		});
-		filtered.write(new ImageOutputFormat(), outputFilePath).setParallelism(1);
+		// [10-48] BestObservation
+		// TODO
+
+		// [49-74] Statistics
+		// Filter by BandNames
+		DataSet<Tuple3<String, byte[], byte[]>> scenes2000_blue = scenes
+				.filter(new FilterByDate("2000-01-01", "2000-12-31"))
+				.filter(new FilterByBandNames("band5"));
+		// Calculate Statistics:
+		// 0p		- aka min
+		DataSet<Tuple3<String, byte[], byte[]>> scenes2000_blue_min = scenes2000_blue.reduce(new Min());
+		// TODO 25p
+		// TODO 50p		- aka median
+		// TODO 75p
+		// 100p	- aka max
+		DataSet<Tuple3<String, byte[], byte[]>> scenes2000_blue_max = scenes2000_blue.reduce(new Max());
+		// mean
+		DataSet<Tuple3<String, byte[], byte[]>> scenes2000_blue_avg = scenes2000_blue
+				.map(new AverageMap())
+				.reduce(new AverageReduce())
+				.map(new AverageFinish());
+		// TODO stdev
+		// TODO Put all statistics in one Tuple as different bands
+
+		// [75-95] Classifying
+		// TODO
+
+		DataSet<Tuple3<String, byte[], byte[]>> result = scenes2000_blue_avg;
+
+		ImageOutputFormat outputFormat = new ImageOutputFormat();
+		outputFormat.setWriteMode(FileSystem.WriteMode.OVERWRITE);
+		result.write(outputFormat, outputFilePath).setParallelism(1);
+
 		env.execute("Image Test");
 	}
 
@@ -82,6 +122,348 @@ public class ImageTest {
 		imageFormat.configure(true);
 		TupleTypeInfo<Tuple3<String, byte[], byte[]>> typeInfo = new TupleTypeInfo<Tuple3<String, byte[], byte[]>>(BasicTypeInfo.STRING_TYPE_INFO, PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO, PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO);
 		return new DataSource<Tuple3<String, byte[], byte[]>>(env, imageFormat, typeInfo, "imageSource");
+	}
+
+}
+
+/**
+ * Filters by AcquisitionDate
+ */
+class FilterByDate implements FilterFunction<Tuple3<String, byte[], byte[]>> {
+
+	private Date oldest;
+	private Date youngest;
+
+	/**
+	 * @param oldest String-Format: "yyyy-MM-dd"
+	 * @param youngest String-Format: "yyyy-MM-dd"
+	 * @throws ParseException
+     */
+	public FilterByDate(String oldest, String youngest) throws ParseException {
+		DateFormat df = new SimpleDateFormat("yyyy-MM-dd");
+
+		if (oldest != null) {
+			this.oldest = df.parse(oldest);
+		}
+		if (youngest != null) {
+			this.youngest = df.parse(youngest);
+		}
+	}
+
+
+	@Override
+	public boolean filter(Tuple3<String, byte[], byte[]> value) throws Exception {
+
+		ImageInfoWrapper metaData = new ImageInfoWrapper(value.f1);
+		boolean in = true;
+
+		if (in && youngest != null) {
+			in = metaData.getAcquisitionDateAsLong() <= youngest.getTime();
+		}
+
+		if (in && oldest != null) {
+			in = metaData.getAcquisitionDateAsLong() >= oldest.getTime();
+		}
+
+		return in;
+	}
+}
+
+/**
+ * Filters by BandNames
+ */
+class FilterByBandNames implements FilterFunction<Tuple3<String, byte[], byte[]>> {
+
+	private String[] bandNames;
+
+	public FilterByBandNames(String... bandNames) {
+		this.bandNames = bandNames;
+	}
+
+	@Override
+	public boolean filter(Tuple3<String, byte[], byte[]> value) throws Exception {
+
+		ImageInfoWrapper metaData = new ImageInfoWrapper(value.f1);
+		// Assuming there is only one band in the input
+		String band = metaData.getBandNames()[0];
+
+		if (Arrays.asList(this.bandNames).contains(band))  {
+			return true;
+		}
+		return false;
+	}
+}
+
+class AverageMap implements MapFunction<Tuple3<String, byte[], byte[]>, Tuple4<String, byte[], int[], int[]>> {
+
+	@Override
+	public Tuple4<String, byte[], int[], int[]> map(Tuple3<String, byte[], byte[]> value) throws Exception {
+		ImageInfoWrapper metaData = new ImageInfoWrapper(value.f1);
+		short dataIgnoreValue = metaData.getDataIgnoreValue();
+
+
+		Tuple4<String, byte[], int[], int[]> result = new Tuple4<String, byte[], int[], int[]>();
+		result.f0 = value.f0;
+		result.f1 = value.f1;
+
+		short[] values = ArrayHelper.byteToShort(value.f2);
+		int[] valueCount = new int[values.length];
+		int[] sums = new int[values.length];
+
+		for(int i = 0; i < sums.length; i++) {
+			if (values[i] != dataIgnoreValue) {
+				sums[i] = values[i];
+				valueCount[i] = 1;
+			} else {
+				sums[i] = 0;
+				valueCount[i] = 0;
+			}
+		}
+
+		result.f2 = valueCount;
+		result.f3 = sums;
+		return result;
+	}
+}
+
+class AverageReduce implements ReduceFunction<Tuple4<String, byte[], int[], int[]>> {
+
+	@Override
+	public Tuple4<String, byte[], int[], int[]> reduce(Tuple4<String, byte[], int[], int[]> value1, Tuple4<String, byte[], int[], int[]> value2) throws Exception {
+		ImageInfoWrapper metaDataLeft = new ImageInfoWrapper(value1.f1);
+		ImageInfoWrapper metaDataRight = new ImageInfoWrapper(value2.f1);
+		short dataIgnoreValue = metaDataLeft.getDataIgnoreValue();
+
+		int samplesLeft = metaDataLeft.getSamples();
+		int samplesRight = metaDataRight.getSamples();
+		int samplesOut = samplesLeft > samplesRight ? samplesLeft : samplesRight;
+
+		int linesLeft = metaDataLeft.getLines();
+		int linesRight = metaDataRight.getLines();
+		int linesOut = linesLeft > linesRight ? linesLeft : linesRight;
+
+		// TODO Some sanity checks?
+
+		// Convert input to shorts (assuming only datatype ever used)
+		int[] valuesLeft = value1.f3;
+		int[] counterLeft = value1.f2;
+		int[] valuesRight = value2.f3;
+		int[] counterRight = value2.f2;
+		int[] counter = new int[linesOut * samplesOut];
+		int[] sums = new int[linesOut * samplesOut];
+
+		ImageInfoWrapper metaDataMin = metaDataLeft;
+		metaDataMin.setBandNames(new String[]{"average"});
+		metaDataMin.setLines(linesOut);
+		metaDataMin.setSamples(samplesOut);
+
+		for(int i = 0; i < linesOut; i++) {
+			for(short j = 0; j < samplesOut; j++) {
+				// Set default
+				int outPos = i * samplesOut + j;
+
+				// Load data, if available
+				int valueLeft = 0;
+				int countLeft = 0;
+				if (i < linesLeft && j < samplesLeft) {
+					int pos = i * samplesLeft + j;
+					valueLeft = valuesLeft[pos];
+					countLeft = counterLeft[pos];
+				}
+
+				int valueRight = 0;
+				int countRight = 0;
+				if (i < linesRight && j < samplesRight) {
+					int pos = i * samplesRight + j;
+					valueRight = valuesRight[pos];
+					countRight = counterRight[pos];
+				}
+
+				counter[outPos] = countLeft + countRight;
+				sums[outPos] = valueLeft + valueRight;
+			}
+		}
+
+		return new Tuple4<>(value1.f0, metaDataMin.toBytes(), counter, sums);
+	}
+}
+
+class AverageFinish implements MapFunction<Tuple4<String, byte[], int[], int[]>, Tuple3<String, byte[], byte[]>> {
+
+	@Override
+	public Tuple3<String, byte[], byte[]> map(Tuple4<String, byte[], int[], int[]> value) throws Exception {
+		ImageInfoWrapper metaData = new ImageInfoWrapper(value.f1);
+		short dataIgnoreValue = metaData.getDataIgnoreValue();
+
+		Tuple3<String, byte[], byte[]> result = new Tuple3<>();
+
+		result.f0 = value.f0;
+		result.f1 = value.f1;
+
+		int[] counts = value.f2;
+		int[] sums = value.f3;
+		short[] averages = new short[sums.length];
+
+		for (int i = 0; i < averages.length; i++) {
+			if (counts[i] > 0) {
+				averages[i] = (short) (sums[i] / counts[i]);
+			} else  {
+				averages[i] = dataIgnoreValue;
+			}
+		}
+
+		result.f2 = ArrayHelper.shortToByte(averages);
+
+		return result;
+	}
+}
+
+/**
+ * Returns the min for each pixel, sets bandName "Min"
+ */
+class Min implements ReduceFunction<Tuple3<String, byte[], byte[]>> {
+
+	@Override
+	public Tuple3<String, byte[], byte[]> reduce(Tuple3<String, byte[], byte[]> value1, Tuple3<String, byte[], byte[]> value2) throws Exception {
+		ImageInfoWrapper metaDataLeft = new ImageInfoWrapper(value1.f1);
+		ImageInfoWrapper metaDataRight = new ImageInfoWrapper(value2.f1);
+		short dataIgnoreValue = metaDataLeft.getDataIgnoreValue();
+
+		int samplesLeft = metaDataLeft.getSamples();
+		int samplesRight = metaDataRight.getSamples();
+		int samplesOut = samplesLeft > samplesRight ? samplesLeft : samplesRight;
+
+		int linesLeft = metaDataLeft.getLines();
+		int linesRight = metaDataRight.getLines();
+		int linesOut = linesLeft > linesRight ? linesLeft : linesRight;
+
+		// TODO Some sanity checks?
+
+		// Convert input to shorts (assuming only datatype ever used)
+		short[] valuesLeft = ArrayHelper.byteToShort(value1.f2);
+		short[] valuesRight = ArrayHelper.byteToShort(value2.f2);
+		short[] min = new short[linesOut * samplesOut];
+
+		ImageInfoWrapper metaDataMin = metaDataLeft;
+		metaDataMin.setBandNames(new String[]{"min"});
+		metaDataMin.setLines(linesOut);
+		metaDataMin.setSamples(samplesOut);
+
+		for(int i = 0; i < linesOut; i++) {
+			for(short j = 0; j < samplesOut; j++) {
+				// Set default
+				int outPost = i * samplesOut + j;
+				min[outPost] = dataIgnoreValue;
+
+				// Load data, if available
+				short valueLeft = dataIgnoreValue;
+				if (i < linesLeft && j < samplesLeft) {
+					int pos = i * samplesLeft + j;
+					valueLeft = valuesLeft[pos];
+				}
+
+				short valueRight = dataIgnoreValue;
+				if (i < linesRight && j < samplesRight) {
+					int pos = i * samplesRight + j;
+					valueRight = valuesRight[pos];
+				}
+
+				// Find min
+				if (valueLeft == dataIgnoreValue && valueRight != dataIgnoreValue) {
+					min[outPost] = valueRight;
+				}
+				if (valueLeft != dataIgnoreValue && valueRight == dataIgnoreValue) {
+					min[outPost] = valueLeft;
+				}
+				if (valueLeft != dataIgnoreValue && valueRight != dataIgnoreValue) {
+					min[outPost] = valueLeft < valueRight ? valueLeft : valueRight;
+				}
+			}
+		}
+
+		return new Tuple3<>(value1.f0, metaDataMin.toBytes(), ArrayHelper.shortToByte(min));
+	}
+}
+
+/**
+ * Returns the max for each pixel, sets bandName "Max"
+ */
+class Max implements ReduceFunction<Tuple3<String, byte[], byte[]>> {
+
+	@Override
+	public Tuple3<String, byte[], byte[]> reduce(Tuple3<String, byte[], byte[]> value1, Tuple3<String, byte[], byte[]> value2) throws Exception {
+		ImageInfoWrapper metaDataLeft = new ImageInfoWrapper(value1.f1);
+		ImageInfoWrapper metaDataRight = new ImageInfoWrapper(value2.f1);
+		short dataIgnoreValue = metaDataLeft.getDataIgnoreValue();
+
+		int samplesLeft = metaDataLeft.getSamples();
+		int samplesRight = metaDataRight.getSamples();
+		int samplesOut = samplesLeft > samplesRight ? samplesLeft : samplesRight;
+
+		int linesLeft = metaDataLeft.getLines();
+		int linesRight = metaDataRight.getLines();
+		int linesOut = linesLeft > linesRight ? linesLeft : linesRight;
+
+		// TODO Some sanity checks?
+
+		// Convert input to shorts (assuming only datatype ever used)
+		short[] valuesLeft = ArrayHelper.byteToShort(value1.f2);
+		short[] valuesRight = ArrayHelper.byteToShort(value2.f2);
+		short[] max = new short[linesOut * samplesOut];
+
+		ImageInfoWrapper metaDataMin = metaDataLeft;
+		metaDataMin.setBandNames(new String[]{"max"});
+		metaDataMin.setLines(linesOut);
+		metaDataMin.setSamples(samplesOut);
+
+		for(int i = 0; i < linesOut; i++) {
+			for(short j = 0; j < samplesOut; j++) {
+				// Set default
+				int outPost = i * samplesOut + j;
+				max[outPost] = dataIgnoreValue;
+
+				// Load data, if available
+				short valueLeft = dataIgnoreValue;
+				if (i < linesLeft && j < samplesLeft) {
+					int pos = i * samplesLeft + j;
+					valueLeft = valuesLeft[pos];
+				}
+
+				short valueRight = dataIgnoreValue;
+				if (i < linesRight && j < samplesRight) {
+					int pos = i * samplesRight + j;
+					valueRight = valuesRight[pos];
+				}
+
+				// Find min
+				if (valueLeft == dataIgnoreValue && valueRight != dataIgnoreValue) {
+					max[outPost] = valueRight;
+				}
+				if (valueLeft != dataIgnoreValue && valueRight == dataIgnoreValue) {
+					max[outPost] = valueLeft;
+				}
+				if (valueLeft != dataIgnoreValue && valueRight != dataIgnoreValue) {
+					max[outPost] = valueLeft > valueRight ? valueLeft : valueRight;
+				}
+			}
+		}
+
+		return new Tuple3<>(value1.f0, metaDataMin.toBytes(), ArrayHelper.shortToByte(max));
+	}
+}
+
+class ArrayHelper {
+
+	public static short[] byteToShort(byte[] byteArray) {
+		short[] shorts = new short[byteArray.length / 2];
+		ByteBuffer.wrap(byteArray).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(shorts);
+		return shorts;
+	}
+
+	public static byte[] shortToByte(short[] shortArray) {
+		byte[] bytes = new byte[shortArray.length * 2];
+		ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(shortArray);
+		return bytes;
 	}
 
 }
