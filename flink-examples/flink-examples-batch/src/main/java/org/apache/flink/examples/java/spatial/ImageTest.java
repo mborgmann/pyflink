@@ -30,6 +30,7 @@ import org.apache.flink.api.java.spatial.envi.ImageInputFormat;
 import org.apache.flink.api.java.spatial.envi.ImageOutputFormat;
 import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.api.java.tuple.Tuple4;
+import org.apache.flink.api.java.tuple.Tuple5;
 import org.apache.flink.api.java.typeutils.TupleTypeInfo;
 import org.apache.flink.core.fs.FileSystem;
 import org.apache.flink.core.fs.Path;
@@ -73,24 +74,29 @@ public class ImageTest {
 				.filter(new FilterByBandNames("band5"));
 		// Calculate Statistics:
 		// 0p		- aka min
-		DataSet<Tuple3<String, byte[], byte[]>> scenes2000_blue_min = scenes2000_blue.reduce(new Min());
+		// DataSet<Tuple3<String, byte[], byte[]>> scenes2000_blue_min = scenes2000_blue.reduce(new Min());
 		// TODO 25p
 		// TODO 50p		- aka median
 		// TODO 75p
 		// 100p	- aka max
-		DataSet<Tuple3<String, byte[], byte[]>> scenes2000_blue_max = scenes2000_blue.reduce(new Max());
+		// DataSet<Tuple3<String, byte[], byte[]>> scenes2000_blue_max = scenes2000_blue.reduce(new Max());
 		// mean
-		DataSet<Tuple3<String, byte[], byte[]>> scenes2000_blue_avg = scenes2000_blue
-				.map(new AverageMap())
-				.reduce(new AverageReduce())
-				.map(new AverageFinish());
-		// TODO stdev
+		//DataSet<Tuple3<String, byte[], byte[]>> scenes2000_blue_avg = scenes2000_blue
+		//		.map(new AverageMap())
+		//		.reduce(new AverageReduce())
+		//		.map(new AverageFinish());
+		// stdev
+		DataSet<Tuple3<String, byte[], byte[]>> scenes2000_blue_stddev = scenes2000_blue
+				.map(new StdDevMap())
+				.reduce(new StdDevReduce())
+				.map(new StdDevFinish());
+
 		// TODO Put all statistics in one Tuple as different bands
 
 		// [75-95] Classifying
 		// TODO
 
-		DataSet<Tuple3<String, byte[], byte[]>> result = scenes2000_blue_avg;
+		DataSet<Tuple3<String, byte[], byte[]>> result = scenes2000_blue_stddev;
 
 		ImageOutputFormat outputFormat = new ImageOutputFormat();
 		outputFormat.setWriteMode(FileSystem.WriteMode.OVERWRITE);
@@ -191,6 +197,162 @@ class FilterByBandNames implements FilterFunction<Tuple3<String, byte[], byte[]>
 			return true;
 		}
 		return false;
+	}
+}
+
+/**
+ * Implementation follows: https://de.wikipedia.org/wiki/Standardabweichung#Berechnung_f.C3.BCr_auflaufende_Messwerte
+ * Might be replaced with better algorithm from Knuth - SemiNumericalAlgorithms(4.2.2) or Welford - Technometrics
+ *
+ * Tuple: Key, Header, valueCount, SquareSums, Sums
+ */
+class StdDevMap implements  MapFunction<Tuple3<String, byte[], byte[]>, Tuple5<String, byte[], int[], long[], int[]>> {
+
+	@Override
+	public Tuple5<String, byte[], int[], long[], int[]> map(Tuple3<String, byte[], byte[]> value) throws Exception {
+		ImageInfoWrapper metaData = new ImageInfoWrapper(value.f1);
+		short dataIgnoreValue = metaData.getDataIgnoreValue();
+
+		Tuple5<String, byte[], int[], long[], int[]> result = new Tuple5<>();
+		result.f0 = value.f0;
+		result.f1 = value.f1;
+
+		short[] values = ArrayHelper.byteToShort(value.f2);
+		int[] valueCount = new int[values.length];
+		long[] squares = new long[values.length];
+		int[] sums = new int[values.length];
+
+		for(int i = 0; i < sums.length; i++) {
+			if (values[i] != dataIgnoreValue) {
+				sums[i] = values[i];
+				squares[i] = values[i] * values[i];
+				valueCount[i] = 1;
+			} else {
+				sums[i] = 0;
+				squares[i] = 0;
+				valueCount[i] = 0;
+			}
+		}
+
+		result.f2 = valueCount;
+		result.f3 = squares;
+		result.f4 = sums;
+
+		return result;
+	}
+}
+
+class StdDevReduce implements ReduceFunction<Tuple5<String, byte[], int[], long[], int[]>> {
+
+	@Override
+	public Tuple5<String, byte[], int[], long[], int[]> reduce(Tuple5<String, byte[], int[], long[], int[]> value1, Tuple5<String, byte[], int[], long[], int[]> value2) throws Exception {
+		ImageInfoWrapper metaDataLeft = new ImageInfoWrapper(value1.f1);
+		ImageInfoWrapper metaDataRight = new ImageInfoWrapper(value2.f1);
+		short dataIgnoreValue = metaDataLeft.getDataIgnoreValue();
+
+		int samplesLeft = metaDataLeft.getSamples();
+		int samplesRight = metaDataRight.getSamples();
+		int samplesOut = samplesLeft > samplesRight ? samplesLeft : samplesRight;
+
+		int linesLeft = metaDataLeft.getLines();
+		int linesRight = metaDataRight.getLines();
+		int linesOut = linesLeft > linesRight ? linesLeft : linesRight;
+
+		// TODO Some sanity checks?
+
+		// Convert input to shorts (assuming only datatype ever used)
+		int[] counterLeft = value1.f2;
+		long[] squaresLeft = value1.f3;
+		int[] sumsLeft = value1.f4;
+		int[] counterRight = value2.f2;
+		long[] squaresRight = value2.f3;
+		int[] sumsRight = value2.f4;
+
+		int[] counter = new int[linesOut * samplesOut];
+		int[] sums = new int[linesOut * samplesOut];
+		long[] squares = new long[linesOut * samplesOut];
+
+		ImageInfoWrapper metaDataMin = metaDataLeft;
+		metaDataMin.setBandNames(new String[]{"std-dev"});
+		metaDataMin.setLines(linesOut);
+		metaDataMin.setSamples(samplesOut);
+
+		for(int i = 0; i < linesOut; i++) {
+			for(short j = 0; j < samplesOut; j++) {
+				// Set default
+				int outPos = i * samplesOut + j;
+
+				// Load data, if available
+				int countLeft = 0;
+				long squareLeft = 0;
+				int sumLeft = 0;
+				if (i < linesLeft && j < samplesLeft) {
+					int pos = i * samplesLeft + j;
+
+					countLeft = counterLeft[pos];
+					squareLeft = squaresLeft[pos];
+					sumLeft = sumsLeft[pos];
+				}
+
+				int countRight = 0;
+				long squareRight = 0;
+				int sumRight = 0;
+				if (i < linesRight && j < samplesRight) {
+					int pos = i * samplesRight + j;
+
+					countRight = counterRight[pos];
+					squareRight = squaresRight[pos];
+					sumRight = sumsRight[pos];
+				}
+
+				counter[outPos] = countLeft + countRight;
+				squares[outPos] = squareLeft + squareRight;
+				sums[outPos] = sumLeft + sumRight;
+			}
+		}
+
+		return new Tuple5<>(value1.f0, metaDataMin.toBytes(), counter, squares, sums);
+	}
+}
+
+class StdDevFinish implements MapFunction<Tuple5<String, byte[], int[], long[], int[]>, Tuple3<String, byte[], byte[]>> {
+
+	@Override
+	public Tuple3<String, byte[], byte[]> map(Tuple5<String, byte[], int[], long[], int[]> value) throws Exception {
+		ImageInfoWrapper metaData = new ImageInfoWrapper(value.f1);
+		short dataIgnoreValue = metaData.getDataIgnoreValue();
+
+		Tuple3<String, byte[], byte[]> result = new Tuple3<>();
+
+		result.f0 = value.f0;
+		result.f1 = value.f1;
+
+		int[] counts = value.f2;
+		long[] squares = value.f3;
+		int[] sums = value.f4;
+
+		short[] stdDevs = new short[sums.length];
+
+		for (int i = 0; i < stdDevs.length; i++) {
+			if (counts[i] > 0) {
+
+				double a = 0;
+				if (counts[i] > 1) {
+					a = (squares[i] - (sums[i] * sums[i]) / counts[i]) / (counts[i] - 1);
+				}
+				if (a != 0) {
+					a = Math.sqrt(a);
+				}
+
+				stdDevs[i] = (short) a;
+			} else  {
+				stdDevs[i] = dataIgnoreValue;
+			}
+		}
+
+		result.f2 = ArrayHelper.shortToByte(stdDevs);
+
+		return result;
 	}
 }
 
