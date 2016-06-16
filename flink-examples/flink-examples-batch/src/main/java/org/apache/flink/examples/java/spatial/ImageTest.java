@@ -65,13 +65,17 @@ public class ImageTest {
 		// TODO
 
 		// [10-48] BestObservation
-		// TODO
+		DataSet<Tuple3<String, byte[], byte[]>> bestObservations = scenes
+				.filter(new FilterByBandNames("band5"))
+				.map(new BestObservationMapper("2000-06-01"))
+				.reduce(new BestObservationReducer())
+				.map(new BestObservationFinish());
 
 		// [49-74] Statistics
 		// Filter by BandNames
-		DataSet<Tuple3<String, byte[], byte[]>> scenes2000_blue = scenes
-				.filter(new FilterByDate("2000-01-01", "2000-12-31"))
-				.filter(new FilterByBandNames("band5"));
+		// DataSet<Tuple3<String, byte[], byte[]>> scenes2000_blue = scenes
+		//		.filter(new FilterByDate("2000-01-01", "2000-12-31"))
+		//		.filter(new FilterByBandNames("band5"));
 		// Calculate Statistics:
 		// 0p		- aka min
 		// DataSet<Tuple3<String, byte[], byte[]>> scenes2000_blue_min = scenes2000_blue.reduce(new Min());
@@ -86,17 +90,17 @@ public class ImageTest {
 		//		.reduce(new AverageReduce())
 		//		.map(new AverageFinish());
 		// stdev
-		DataSet<Tuple3<String, byte[], byte[]>> scenes2000_blue_stddev = scenes2000_blue
-				.map(new StdDevMap())
-				.reduce(new StdDevReduce())
-				.map(new StdDevFinish());
+		// DataSet<Tuple3<String, byte[], byte[]>> scenes2000_blue_stddev = scenes2000_blue
+		// 		.map(new StdDevMap())
+		// 		.reduce(new StdDevReduce())
+		// 		.map(new StdDevFinish());
 
 		// TODO Put all statistics in one Tuple as different bands
 
 		// [75-95] Classifying
 		// TODO
 
-		DataSet<Tuple3<String, byte[], byte[]>> result = scenes2000_blue_stddev;
+		DataSet<Tuple3<String, byte[], byte[]>> result = bestObservations;
 
 		ImageOutputFormat outputFormat = new ImageOutputFormat();
 		outputFormat.setWriteMode(FileSystem.WriteMode.OVERWRITE);
@@ -131,6 +135,125 @@ public class ImageTest {
 	}
 
 }
+
+/**
+ * The integer array contains the number of days away from the target
+ */
+class BestObservationMapper implements MapFunction<Tuple3<String, byte[], byte[]>, Tuple4<String, byte[], byte[], int[]>> {
+
+	private Date target;
+
+	public BestObservationMapper(String target) throws ParseException {
+		DateFormat df = new SimpleDateFormat("yyyy-MM-dd");
+
+		if (target != null) {
+			this.target = df.parse(target);
+		}
+	}
+
+	@Override
+	public Tuple4<String, byte[], byte[], int[]> map(Tuple3<String, byte[], byte[]> value) throws Exception {
+		ImageInfoWrapper metaData = new ImageInfoWrapper(value.f1);
+
+		Tuple4<String, byte[], byte[], int[]> result = new Tuple4<>();
+		result.f0 = value.f0;
+		result.f1 = value.f1;
+		result.f2 = value.f2;
+
+		int currentDistance = (int) Math.abs(metaData.getAcquisitionDateAsLong() - target.getTime());
+		int[] distances = new int[value.f2.length / 2];
+		for (int i = 0; i < distances.length; i++) {
+			distances[i] = currentDistance;
+		}
+
+		result.f3 = distances;
+
+		return result;
+	}
+}
+
+class BestObservationReducer implements ReduceFunction<Tuple4<String, byte[], byte[], int[]>> {
+
+	@Override
+	public Tuple4<String, byte[], byte[], int[]> reduce(Tuple4<String, byte[], byte[], int[]> value1, Tuple4<String, byte[], byte[], int[]> value2) throws Exception {
+		ImageInfoWrapper metaDataLeft = new ImageInfoWrapper(value1.f1);
+		ImageInfoWrapper metaDataRight = new ImageInfoWrapper(value2.f1);
+		short dataIgnoreValue = metaDataLeft.getDataIgnoreValue();
+
+		int samplesLeft = metaDataLeft.getSamples();
+		int samplesRight = metaDataRight.getSamples();
+		int samplesOut = samplesLeft > samplesRight ? samplesLeft : samplesRight;
+
+		int linesLeft = metaDataLeft.getLines();
+		int linesRight = metaDataRight.getLines();
+		int linesOut = linesLeft > linesRight ? linesLeft : linesRight;
+
+		// TODO Some sanity checks?
+
+		// Convert input to shorts (assuming only datatype ever used)
+		short[] valuesLeft = ArrayHelper.byteToShort(value1.f2);
+		int[] distancesLeft = value1.f3;
+		short[] valuesRight = ArrayHelper.byteToShort(value2.f2);
+		int[] distancesRight = value2.f3;
+
+		short[] values = new short[linesOut * samplesOut];
+		int[] distances = new int[linesOut * samplesOut];
+
+		ImageInfoWrapper metaDataMin = metaDataLeft;
+		metaDataMin.setLines(linesOut);
+		metaDataMin.setSamples(samplesOut);
+
+		for(int i = 0; i < linesOut; i++) {
+			for(short j = 0; j < samplesOut; j++) {
+				// Set default
+				int outPos = i * samplesOut + j;
+
+				// Load data, if available
+				int distanceLeft = 0;
+				short valueLeft = dataIgnoreValue;
+				if (i < linesLeft && j < samplesLeft) {
+					int pos = i * samplesLeft + j;
+
+					distanceLeft = distancesLeft[pos];
+					valueLeft = valuesLeft[pos];
+				}
+
+				int distanceRight = 0;
+				short valueRight = dataIgnoreValue;
+				if (i < linesRight && j < samplesRight) {
+					int pos = i * samplesRight + j;
+
+					distanceRight = distancesRight[pos];
+					valueRight = valuesRight[pos];
+				}
+
+				if (valueLeft != dataIgnoreValue && valueRight != dataIgnoreValue) {
+					values[outPos] = (distanceLeft < distanceRight) ? valueLeft : valueRight;
+					distances[outPos] = (distanceLeft < distanceRight) ? distanceLeft : distanceRight;
+				} else {
+					values[outPos] = (valueLeft != dataIgnoreValue) ? valueLeft : valueRight;
+					distances[outPos] = (valueLeft != dataIgnoreValue) ? distanceLeft : distanceRight;
+				}
+			}
+		}
+
+		return new Tuple4<>(value1.f0, metaDataMin.toBytes(), ArrayHelper.shortToByte(values), distances);
+	}
+}
+
+class BestObservationFinish implements MapFunction<Tuple4<String, byte[], byte[], int[]>, Tuple3<String, byte[], byte[]>> {
+
+	@Override
+	public Tuple3<String, byte[], byte[]> map(Tuple4<String, byte[], byte[], int[]> value) throws Exception {
+		Tuple3<String, byte[], byte[]> result = new Tuple3<>();
+		result.f0 = value.f0;
+		result.f1 = value.f1;
+		result.f2 = value.f2;
+
+		return result;
+	}
+}
+
 
 /**
  * Filters by AcquisitionDate
